@@ -12,7 +12,7 @@ async def asingle_shot_llm_call(
     message: str,
     response_format: Optional[dict[str, str | dict[str, Any]]] = None,
     max_completion_tokens: int | None = None,
-) -> str:
+) -> tuple[str, dict]:
     response = await acompletion(
         model=model,
         messages=[{"role": "system", "content": system_prompt},
@@ -24,7 +24,18 @@ async def asingle_shot_llm_call(
         max_tokens=max_completion_tokens,
         timeout=600,
     )
-    return response.choices[0].message["content"]  # type: ignore
+    
+    # Extract token usage data
+    token_usage = {}
+    if hasattr(response, 'usage'):
+        usage = response.usage
+        token_usage = {
+            'completion_tokens': getattr(usage, 'completion_tokens', 0),
+            'prompt_tokens': getattr(usage, 'prompt_tokens', 0),
+            'total_tokens': getattr(usage, 'total_tokens', 0),
+        }
+    
+    return response.choices[0].message["content"], token_usage  # type: ignore
 
 
 @tenacity.retry(stop=tenacity.stop_after_attempt(3), wait=tenacity.wait_exponential(multiplier=1, min=4, max=15))

@@ -5,10 +5,13 @@ import json
 import os
 import pickle
 import re
+import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, List
+from typing import Callable, Dict, List, Tuple
 
+import matplotlib.pyplot as plt
+import numpy as np
 import yaml
 from dotenv import load_dotenv
 from filelock import FileLock
@@ -42,6 +45,7 @@ class DeepResearcher:
         cache_dir: str | None = None,
         use_cache: bool = False,
         observer: Callable | None = None,
+        profile_output_dir: str | None = None,
     ):
         self.budget = budget
         self.current_spending = 0
@@ -58,6 +62,9 @@ class DeepResearcher:
         self.debug_file_path = debug_file_path
         self.communication = UserCommunication()
         self.use_cache = use_cache
+        self.profile_output_dir = profile_output_dir
+        self.profiling_data = {}
+        self.token_usage = {}
 
         # this is a little hack to make the observer optional
         self.observer = observer if observer is not None else lambda *args, **kwargs: None
@@ -68,6 +75,9 @@ class DeepResearcher:
             # Create a locks directory for the file locks
             self.locks_dir = self.cache_dir / ".locks"
             self.locks_dir.mkdir(parents=True, exist_ok=True)
+        
+        if self.profile_output_dir:
+            os.makedirs(self.profile_output_dir, exist_ok=True)
 
         with open(os.path.join(os.path.dirname(__file__), "prompts.yaml"), "r") as f:
             self.prompts = yaml.safe_load(f)
@@ -95,38 +105,298 @@ class DeepResearcher:
         finally:
             loop.close()
 
+    @contextmanager
+    def _profile_step(self, step_name: str):
+        """Context manager to profile a step of the research process"""
+        start_time = time.time()
+        try:
+            yield
+        finally:
+            elapsed = time.time() - start_time
+            if step_name not in self.profiling_data:
+                self.profiling_data[step_name] = []
+            self.profiling_data[step_name].append(elapsed)
+            logging.info(f"Step '{step_name}' took {elapsed:.2f} seconds")
+
+    def save_profile_data(self, topic: str):
+        """Save profiling data to files and generate visualizations"""
+        if not self.profile_output_dir:
+            return
+        
+        # Sanitize topic for filename
+        sanitized_topic = re.sub(r'[\\/*?:"<>|]', "_", topic)
+        
+        # Save raw profile data
+        profile_file = os.path.join(self.profile_output_dir, f"profile_data_{sanitized_topic}.json")
+        with open(profile_file, 'w') as f:
+            json.dump(self.profiling_data, f, indent=2)
+        
+        # Save token usage data
+        token_file = os.path.join(self.profile_output_dir, f"token_usage_{sanitized_topic}.json")
+        with open(token_file, 'w') as f:
+            json.dump(self.token_usage, f, indent=2)
+        
+        # Generate cumulative time chart
+        self._generate_profile_charts(sanitized_topic)
+        
+        logging.info(f"Profiling data saved to {self.profile_output_dir}")
+
+    def _generate_profile_charts(self, topic_name: str):
+        """Generate charts for profiling data"""
+        if not self.profiling_data:
+            return
+            
+        # Calculate total time per step
+        step_totals = {step: sum(times) for step, times in self.profiling_data.items()}
+        
+        # Create time distribution pie chart (excluding total_execution_time)
+        pie_data = {k: v for k, v in step_totals.items() if k != "total_execution_time" and k != "sequential search" and k != "sequential summarize"}
+        plt.figure(figsize=(10, 6))
+        plt.pie(list(pie_data.values()), labels=list(pie_data.keys()), autopct='%1.1f%%')
+        plt.title('Time Distribution Across Research Steps')
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.profile_output_dir, f"time_distribution_{topic_name}.png"))
+        plt.close()
+        
+        # Create bar chart of step durations
+        bar_data = {k: v for k, v in step_totals.items() if k != "sequential search" and k != "sequential summarize"}
+        plt.figure(figsize=(12, 6))
+        steps = list(bar_data.keys())
+        durations = list(bar_data.values())
+        plt.barh(steps, durations)
+        plt.xlabel('Time (seconds)')
+        plt.title('Duration of Each Research Step')
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.profile_output_dir, f"step_durations_{topic_name}.png"))
+        plt.close()
+        
+        # Generate token usage charts if we have that data
+        if self.token_usage:
+            self._generate_token_usage_charts(topic_name)
+            
+        # Create a flame graph visualization
+        self._generate_simple_flame_graph(topic_name)
+        
+    def _generate_token_usage_charts(self, topic_name: str):
+        """Generate charts for token usage data"""
+        if not self.token_usage:
+            return
+            
+        # Calculate total tokens per step
+        token_totals = {step: sum(data['total_tokens']) for step, data in self.token_usage.items()}
+        
+        # Create token distribution pie chart
+        plt.figure(figsize=(10, 6))
+        plt.pie(list(token_totals.values()), labels=list(token_totals.keys()), autopct='%1.1f%%')
+        plt.title('Token Usage Distribution Across Steps')
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.profile_output_dir, f"token_distribution_{topic_name}.png"))
+        plt.close()
+        
+        # Create bar charts showing both total sums and means with std
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
+        steps = list(self.token_usage.keys())
+        
+        # Calculate sums, means and standard deviations
+        prompt_sums = [sum(data['prompt_tokens']) for step, data in self.token_usage.items()]
+        completion_sums = [sum(data['completion_tokens']) for step, data in self.token_usage.items()]
+        prompt_means = [np.mean(data['prompt_tokens']) for step, data in self.token_usage.items()]
+        prompt_stds = [np.std(data['prompt_tokens']) if len(data['prompt_tokens']) > 1 else 0 
+                      for step, data in self.token_usage.items()]
+        completion_means = [np.mean(data['completion_tokens']) for step, data in self.token_usage.items()]
+        completion_stds = [np.std(data['completion_tokens']) if len(data['completion_tokens']) > 1 else 0 
+                         for step, data in self.token_usage.items()]
+        
+        x = np.arange(len(steps))
+        width = 0.35
+        
+        # Left subplot: Total sums
+        ax1.bar(x - width/2, prompt_sums, width, label='Prompt Tokens')
+        ax1.bar(x + width/2, completion_sums, width, label='Completion Tokens')
+        ax1.set_xlabel('Steps')
+        ax1.set_ylabel('Total Number of Tokens')
+        ax1.set_title('Total Token Usage by Step')
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(steps, rotation=45, ha='right')
+        
+        # Add sum values on top of bars
+        for i in range(len(steps)):
+            ax1.text(i - width/2, prompt_sums[i], f'{prompt_sums[i]:,}', 
+                    ha='center', va='bottom', rotation=45)
+            ax1.text(i + width/2, completion_sums[i], f'{completion_sums[i]:,}', 
+                    ha='center', va='bottom', rotation=45)
+        
+        # Right subplot: Means with std
+        bars1 = ax2.bar(x - width/2, prompt_means, width, yerr=prompt_stds, 
+                       capsize=5, label='Prompt Tokens')
+        bars2 = ax2.bar(x + width/2, completion_means, width, yerr=completion_stds, 
+                       capsize=5, label='Completion Tokens')
+        ax2.set_xlabel('Steps')
+        ax2.set_ylabel('Mean Number of Tokens')
+        ax2.set_title('Mean Token Usage by Step (with Standard Deviation)')
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(steps, rotation=45, ha='right')
+        
+        # Add mean±std values on top of bars
+        for i in range(len(steps)):
+            ax2.text(i - width/2, prompt_means[i] + prompt_stds[i], 
+                    f'μ={prompt_means[i]:.0f}±{prompt_stds[i]:.0f}', 
+                    ha='center', va='bottom', rotation=45)
+            ax2.text(i + width/2, completion_means[i] + completion_stds[i], 
+                    f'μ={completion_means[i]:.0f}±{completion_stds[i]:.0f}', 
+                    ha='center', va='bottom', rotation=45)
+        
+        # Add legends to both subplots
+        ax1.legend()
+        ax2.legend()
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.profile_output_dir, f"token_breakdown_{topic_name}.png"))
+        plt.close()
+
+    def _generate_simple_flame_graph(self, topic_name: str):
+        """Generate a simple flame graph visualization of the research process"""
+        if not self.profiling_data:
+            return
+            
+        # Group steps by their common prefixes (e.g., "evaluate_research_iteration_1" -> "evaluate")
+        step_groups = {}
+        for step in self.profiling_data:
+            # Extract the first part of the step name before underscore
+            main_category = step.split('_')[0] if '_' in step else step
+            if main_category not in step_groups:
+                step_groups[main_category] = []
+            
+            # Add this step to its group with its duration
+            for duration in self.profiling_data[step]:
+                step_groups[main_category].append((step, duration))
+        
+        # Sort groups by their first appearance in the process
+        # This is approximate since we don't track the exact order of calls
+        ordered_groups = []
+        for step_type in ['total_execution_time', 'topic clarification', 'generate queries', 'search and summarize', 'evaluate research completeness', 'filter', 'write report']:
+            if step_type in step_groups:
+                ordered_groups.append(step_type)
+                
+        # Define a colormap with distinct colors for each category
+        colors = plt.cm.viridis(np.linspace(0, 0.9, len(ordered_groups)))
+        color_map = {group: colors[i] for i, group in enumerate(ordered_groups)}
+        
+        # Create the figure
+        plt.figure(figsize=(12, 8))
+        
+        # Current y position
+        y_pos = 0
+        max_time = 0
+        
+        # Track positions for labels
+        label_positions = {}
+        
+        # Draw each group
+        for group in ordered_groups[::-1]:
+            if group not in step_groups:
+                continue
+                
+            steps = step_groups[group]
+            group_color = color_map[group]
+            group_height = sum(duration for _, duration in steps)
+            
+            # Sort steps by duration (larger first for better visualization)
+            steps.sort(key=lambda x: x[1], reverse=True)
+            
+            # Record the center position for the label
+            label_positions[group] = (0, y_pos + group_height/2)
+            
+            # Keep track of current x position within this row
+            x_pos = 0
+            
+            # Draw each step as a rectangle
+            for step_name, duration in steps:
+                # Draw the rectangle for this step
+                plt.fill_between(
+                    [x_pos, x_pos + duration],
+                    [y_pos, y_pos],
+                    [y_pos + duration, y_pos + duration],
+                    color=group_color,
+                    alpha=0.7,
+                    edgecolor='black',
+                    linewidth=0.5
+                )
+                
+                # Update max_time if needed
+                max_time = max(max_time, x_pos + duration)
+                
+                # Move to the next x position
+                x_pos += duration
+            
+            # Move to the next row
+            y_pos += group_height + 0.5  # Add a small gap between rows
+        
+        # Add labels for each group
+        for group, (x, y) in label_positions.items():
+            plt.text(
+                max_time + 1,  # Place labels at the right side
+                y,
+                group,
+                ha='left',
+                va='center'
+            )
+        
+        # Set chart properties
+        plt.xlabel('Cumulative Time (seconds)')
+        plt.title('Research Process Flame Graph')
+        plt.grid(axis='x', linestyle='--', alpha=0.3)
+        
+        # Only show the bottom of the y-axis
+        plt.yticks([])
+        
+        # Set suitable x-axis limits
+        plt.xlim(0, max_time * 1.15)  # Add some space for labels
+        
+        # Save the figure
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.profile_output_dir, f"flame_graph_{topic_name}.png"))
+        plt.close()
+
     async def research_topic(self, topic: str) -> str:
         """Main method to conduct research on a topic"""
+        # Initialize profiling data for this run
+        self.profiling_data = {}
+        overall_start_time = time.time()
 
         self.observer(0, "Starting research")
 
         # Step 0: Clarify the research topic
-        if self.interactive:
-            self.observer(0.05, "Clarifying research topic")
-            clarified_topic = await self.clarify_topic(topic)
-            self.observer(0.1, "Research topic clarified")
-        else:
-            clarified_topic = topic
+        clarified_topic = ""
+        with self._profile_step("topic_clarification"):
+            if self.interactive:
+                self.observer(0.05, "Clarifying research topic")
+                clarified_topic = await self.clarify_topic(topic)
+                self.observer(0.1, "Research topic clarified")
+            else:
+                clarified_topic = topic
 
-        logging.info(f"Topic: {clarified_topic}")
+            logging.info(f"Topic: {clarified_topic}")
 
         # Step 1: Generate initial queries
-        self.observer(0.15, "Generating research queries")
-        queries = await self.generate_research_queries(clarified_topic)
-        queries = [clarified_topic] + queries[: self.max_queries - 1]
-        all_queries = queries.copy()
-        logging.info(f"Initial queries: {queries}")
-        self.observer(0.2, "Research queries generated")
+        with self._profile_step("generate queries"):
+            self.observer(0.15, "Generating research queries")
+            queries = await self.generate_research_queries(clarified_topic)
+            queries = [clarified_topic] + queries[: self.max_queries - 1]
+            all_queries = queries.copy()
+            logging.info(f"Initial queries: {queries}")
+            self.observer(0.2, "Research queries generated")
 
-        if len(queries) == 0:
-            logging.error("No initial queries generated")
-            return "No initial queries generated"
+            if len(queries) == 0:
+                logging.error("No initial queries generated")
+                return "No initial queries generated"
 
         # Step 2: Perform initial search
-        self.observer(0.25, "Performing initial search")
-        results = await self.search_all_queries(queries)
-        logging.info(f"Initial search complete, found {len(results.results)} results")
-        self.observer(0.3, "Initial search complete")
+        with self._profile_step("search and summarize"):
+            self.observer(0.25, "Performing initial search")
+            results = await self.search_all_queries(queries)  # Already profiled internally
+            logging.info(f"Initial search complete, found {len(results.results)} results")
+            self.observer(0.3, "Initial search complete")
 
         # Step 3: Conduct iterative research within budget
         total_iterations = self.budget - self.current_spending
@@ -136,64 +406,80 @@ class DeepResearcher:
             self.observer(progress, f"Conducting research iteration {current_iteration}/{total_iterations}")
 
             # Evaluate if more research is needed
-            additional_queries = await self.evaluate_research_completeness(clarified_topic, results, all_queries)
+            with self._profile_step(f"evaluate research completeness"):
+                additional_queries = await self.evaluate_research_completeness(clarified_topic, results, all_queries)
 
-            # Filter out empty strings and check if any queries remain
-            additional_queries = [q for q in additional_queries if q]
-            if not additional_queries:
-                logging.info("No need for additional research")
-                self.observer(progress + 0.05, "Research complete - no additional queries needed")
-                break
+                # Filter out empty strings and check if any queries remain
+                additional_queries = [q for q in additional_queries if q]
+                if not additional_queries:
+                    logging.info("No need for additional research")
+                    self.observer(progress + 0.05, "Research complete - no additional queries needed")
+                    break
 
-            # for debugging purposes we limit the number of queries
-            additional_queries = additional_queries[: self.max_queries]
-            logging.info(f"Additional queries: {additional_queries}")
+                # for debugging purposes we limit the number of queries
+                additional_queries = additional_queries[: self.max_queries]
+                logging.info(f"Additional queries: {additional_queries}")
 
             # Expand research with new queries
-            self.observer(progress + 0.02, f"Searching {len(additional_queries)} additional queries")
-            new_results = await self.search_all_queries(additional_queries)
-            logging.info(f"Follow-up search complete, found {len(new_results.results)} results")
-            self.observer(progress + 0.05, f"Found {len(new_results.results)} additional results")
+            with self._profile_step("search and summarize"):
+                self.observer(progress + 0.02, f"Searching {len(additional_queries)} additional queries")
+                # This function already has internal profiling, so we don't wrap it
+                new_results = await self.search_all_queries(additional_queries)
+                logging.info(f"Follow-up search complete, found {len(new_results.results)} results")
+                self.observer(progress + 0.05, f"Found {len(new_results.results)} additional results")
 
             results = results + new_results
             all_queries.extend(additional_queries)
 
         # Step 4: Generate final answer with feedback loop
-        self.observer(0.7, "Filtering and processing results")
-        logging.info(f"Generating final answer for topic: {clarified_topic}")
-        results = results.dedup()
-        logging.info(f"Deduplication complete, kept {len(results.results)} results")
-        filtered_results, sources = await self.filter_results(clarified_topic, results)
-        logging.info(f"LLM Filtering complete, kept {len(filtered_results.results)} results")
-        self.observer(0.8, f"Results filtered: kept {len(filtered_results.results)} sources")
+        with self._profile_step("filter"):
+            self.observer(0.7, "Filtering and processing results")
+            logging.info(f"Generating final answer for topic: {clarified_topic}")
+            results = results.dedup()
+            logging.info(f"Deduplication complete, kept {len(results.results)} results")
+            filtered_results, sources = await self.filter_results(clarified_topic, results)
+            logging.info(f"LLM Filtering complete, kept {len(filtered_results.results)} results")
+            self.observer(0.8, f"Results filtered: kept {len(filtered_results.results)} sources")
 
-        if self.debug_file_path:
-            with open(self.debug_file_path, "w") as f:
-                f.write(f"{results}\n\n\n\n{filtered_results}")
-                logging.info(f"Debug file (web search results and sources) saved to {self.debug_file_path}")
+            if self.debug_file_path:
+                with open(self.debug_file_path, "w") as f:
+                    f.write(f"{results}\n\n\n\n{filtered_results}")
+                    logging.info(f"Debug file (web search results and sources) saved to {self.debug_file_path}")
 
         # Generate final answer
+        answer = ""
         self.observer(0.9, "Generating final research report")
         while True:
-            answer = await self.generate_research_answer(clarified_topic, filtered_results, self.remove_thinking_tags)
+            with self._profile_step(f"write report"):
+                answer = await self.generate_research_answer(clarified_topic, filtered_results, self.remove_thinking_tags)
 
-            if not self.interactive or self.current_spending >= self.budget:
-                self.observer(0.95, "Research complete")
-                return answer
+                if not self.interactive or self.current_spending >= self.budget:
+                    self.observer(0.95, "Research complete")
+                    break
 
-            logging.info(f"Answer: {answer}")
-            user_feedback = await self.communication.get_input_with_timeout(
-                "\nAre you satisfied with this answer? (yes/no) If no, please provide feedback: ",
-                self.user_timeout * TIME_LIMIT_MULTIPLIER,
-            )
+                logging.info(f"Answer: {answer}")
+                user_feedback = await self.communication.get_input_with_timeout(
+                    "\nAre you satisfied with this answer? (yes/no) If no, please provide feedback: ",
+                    self.user_timeout * TIME_LIMIT_MULTIPLIER,
+                )
 
-            if user_feedback.lower() == "yes" or not user_feedback or user_feedback == "":
-                return answer
+                if user_feedback.lower() == "yes" or not user_feedback or user_feedback == "":
+                    break
 
-            # Regenerate answer with user feedback
-            clarified_topic = f"{clarified_topic}\n\nReport:{answer}\n\nAdditional Feedback: {user_feedback}"
-            logging.info(f"Regenerating answer with feedback: {user_feedback}")
-            self.current_spending += 1
+                # Regenerate answer with user feedback
+                clarified_topic = f"{clarified_topic}\n\nReport:{answer}\n\nAdditional Feedback: {user_feedback}"
+                logging.info(f"Regenerating answer with feedback: {user_feedback}")
+                self.current_spending += 1
+
+        # Save the overall execution time
+        overall_time = time.time() - overall_start_time
+        self.profiling_data["total_execution_time"] = [overall_time]
+        logging.info(f"Total research time: {overall_time:.2f} seconds")
+        
+        # Save profiling data and generate visualizations
+        self.save_profile_data(topic)
+        
+        return answer
 
     async def clarify_topic(self, topic: str) -> str:
         """
@@ -207,9 +493,22 @@ class DeepResearcher:
 
         CLARIFICATION_PROMPT = self.prompts["clarification_prompt"]
 
-        clarification = await asingle_shot_llm_call(
+        clarification, token_data = await asingle_shot_llm_call(
             model=self.planning_model, system_prompt=CLARIFICATION_PROMPT, message=f"Research Topic: {topic}"
         )
+        
+        # Track token usage
+        step_name = "topic clarification"
+        if step_name not in self.token_usage:
+            self.token_usage[step_name] = {
+                'completion_tokens': [],
+                'prompt_tokens': [],
+                'total_tokens': []
+            }
+        
+        self.token_usage[step_name]['completion_tokens'].append(token_data.get('completion_tokens', 0))
+        self.token_usage[step_name]['prompt_tokens'].append(token_data.get('prompt_tokens', 0))
+        self.token_usage[step_name]['total_tokens'].append(token_data.get('total_tokens', 0))
 
         logging.info(f"\nTopic Clarification: {clarification}")
 
@@ -230,11 +529,16 @@ class DeepResearcher:
                 self._clarification_context += f"\n{user_input}"
 
             # Get follow-up clarification if needed
-            clarification = await asingle_shot_llm_call(
+            clarification, token_data = await asingle_shot_llm_call(
                 model=self.planning_model,
                 system_prompt=CLARIFICATION_PROMPT,
                 message=f"Research Topic: {topic}\nPrevious Context: {self._clarification_context}",
             )
+            
+            # Track token usage for follow-up clarification
+            self.token_usage[step_name]['completion_tokens'].append(token_data.get('completion_tokens', 0))
+            self.token_usage[step_name]['prompt_tokens'].append(token_data.get('prompt_tokens', 0))
+            self.token_usage[step_name]['total_tokens'].append(token_data.get('total_tokens', 0))
 
             logging.info(f"\nFollow-up Clarification: {clarification}")
             self.current_spending += 1
@@ -245,20 +549,46 @@ class DeepResearcher:
     async def generate_research_queries(self, topic: str) -> list[str]:
         PLANNING_PROMPT = self.prompts["planning_prompt"]
 
-        plan = await asingle_shot_llm_call(
+        plan, token_data = await asingle_shot_llm_call(
             model=self.planning_model, system_prompt=PLANNING_PROMPT, message=f"Research Topic: {topic}"
         )
+        
+        # Track token usage
+        step_name = "generate queries"
+        if step_name not in self.token_usage:
+            self.token_usage[step_name] = {
+                'completion_tokens': [],
+                'prompt_tokens': [],
+                'total_tokens': []
+            }
+        
+        self.token_usage[step_name]['completion_tokens'].append(token_data.get('completion_tokens', 0))
+        self.token_usage[step_name]['prompt_tokens'].append(token_data.get('prompt_tokens', 0))
+        self.token_usage[step_name]['total_tokens'].append(token_data.get('total_tokens', 0))
 
         logging.info(f"\n\nGenerated deep research plan for topic: {topic}\n\nPlan: {plan}\n\n")
 
         SEARCH_PROMPT = self.prompts["plan_parsing_prompt"]
 
-        response_json = await asingle_shot_llm_call(
+        response_json, token_data = await asingle_shot_llm_call(
             model=self.json_model,
             system_prompt=SEARCH_PROMPT,
             message=f"Plan to be parsed: {plan}",
             response_format={"type": "json_object", "schema": ResearchPlan.model_json_schema()},
         )
+        
+        # Track token usage for JSON parsing
+        json_step_name = "json_parsing"
+        if json_step_name not in self.token_usage:
+            self.token_usage[json_step_name] = {
+                'completion_tokens': [],
+                'prompt_tokens': [],
+                'total_tokens': []
+            }
+        
+        self.token_usage[json_step_name]['completion_tokens'].append(token_data.get('completion_tokens', 0))
+        self.token_usage[json_step_name]['prompt_tokens'].append(token_data.get('prompt_tokens', 0))
+        self.token_usage[json_step_name]['total_tokens'].append(token_data.get('total_tokens', 0))
 
         plan = json.loads(response_json)
 
@@ -351,57 +681,73 @@ class DeepResearcher:
 
     async def _search_engine_call(self, query: str) -> DeepResearchResults:
         """Perform a single search"""
+        # Step 1: Execute Tavily search
+        with self._profile_step("sequential search"):
+            if len(query) > 400:
+                # NOTE: we are truncating the query to 400 characters to avoid Tavily Search issues
+                query = query[:400]
+                logging.info(f"Truncated query to 400 characters: {query}")
 
-        if len(query) > 400:
-            # NOTE: we are truncating the query to 400 characters to avoid Tavily Search issues
-            query = query[:400]
-            logging.info(f"Truncated query to 400 characters: {query}")
+            response = await atavily_search_results(query)
+            logging.info("Tavily Search Called.")
 
-        response = await atavily_search_results(query)
+        # Step 2: Summarize content
+        with self._profile_step("sequential summarize"):
+            RAW_CONTENT_SUMMARIZER_PROMPT = self.prompts["raw_content_summarizer_prompt"]
 
-        logging.info("Tavily Search Called.")
+            # Create tasks for summarization
+            summarization_tasks = []
+            result_info = []
+            for result in response.results:
+                if result.raw_content is None:
+                    continue
+                task = self._summarize_content_async(result.raw_content, query, RAW_CONTENT_SUMMARIZER_PROMPT)
+                summarization_tasks.append(task)
+                result_info.append(result)
 
-        RAW_CONTENT_SUMMARIZER_PROMPT = self.prompts["raw_content_summarizer_prompt"]
+            # Use return_exceptions=True to prevent exceptions from propagating
+            summarized_contents = await asyncio.gather(*summarization_tasks, return_exceptions=True)
+            # Filter out exceptions
+            summarized_contents = [result for result in summarized_contents if not isinstance(result, Exception)]
 
-        # Create tasks for summarization
-        summarization_tasks = []
-        result_info = []
-        for result in response.results:
-            if result.raw_content is None:
-                continue
-            task = self._summarize_content_async(result.raw_content, query, RAW_CONTENT_SUMMARIZER_PROMPT)
-            summarization_tasks.append(task)
-            result_info.append(result)
-
-        # Use return_exceptions=True to prevent exceptions from propagating
-        summarized_contents = await asyncio.gather(*summarization_tasks, return_exceptions=True)
-        # Filter out exceptions
-        summarized_contents = [result for result in summarized_contents if not isinstance(result, Exception)]
-
-        formatted_results = []
-        for result, summarized_content in zip(result_info, summarized_contents):
-            formatted_results.append(
-                DeepResearchResult(
-                    title=result.title,
-                    link=result.link,
-                    content=result.content,
-                    raw_content=result.raw_content,
-                    filtered_raw_content=summarized_content,
+            formatted_results = []
+            for result, summarized_content in zip(result_info, summarized_contents):
+                formatted_results.append(
+                    DeepResearchResult(
+                        title=result.title,
+                        link=result.link,
+                        content=result.content,
+                        raw_content=result.raw_content,
+                        filtered_raw_content=summarized_content,
+                    )
                 )
-            )
+            
         return DeepResearchResults(results=formatted_results)
 
     async def _summarize_content_async(self, raw_content: str, query: str, prompt: str) -> str:
         """Summarize content asynchronously using the LLM"""
         logging.info("Summarizing content asynchronously using the LLM")
 
-        result = await asingle_shot_llm_call(
+        content, token_data = await asingle_shot_llm_call(
             model=self.summarization_model,
             system_prompt=prompt,
             message=f"<Raw Content>{raw_content}</Raw Content>\n\n<Research Topic>{query}</Research Topic>",
         )
-
-        return result
+        
+        # Track token usage
+        step_name = "summarize"
+        if step_name not in self.token_usage:
+            self.token_usage[step_name] = {
+                'completion_tokens': [],
+                'prompt_tokens': [],
+                'total_tokens': []
+            }
+        
+        self.token_usage[step_name]['completion_tokens'].append(token_data.get('completion_tokens', 0))
+        self.token_usage[step_name]['prompt_tokens'].append(token_data.get('prompt_tokens', 0))
+        self.token_usage[step_name]['total_tokens'].append(token_data.get('total_tokens', 0))
+        
+        return content
 
     async def evaluate_research_completeness(self, topic: str, results: DeepResearchResults, queries: List[str]) -> list[str]:
         """
@@ -413,7 +759,7 @@ class DeepResearcher:
         formatted_results = str(results)
         EVALUATION_PROMPT = self.prompts["evaluation_prompt"]
 
-        evaluation = await asingle_shot_llm_call(
+        evaluation, token_data = await asingle_shot_llm_call(
             model=self.planning_model,
             system_prompt=EVALUATION_PROMPT,
             message=(
@@ -422,17 +768,43 @@ class DeepResearcher:
                 f"<Current Search Results>{formatted_results}</Current Search Results>"
             ),
         )
+        
+        # Track token usage
+        step_name = "evaluate research completeness"
+        if step_name not in self.token_usage:
+            self.token_usage[step_name] = {
+                'completion_tokens': [],
+                'prompt_tokens': [],
+                'total_tokens': []
+            }
+        
+        self.token_usage[step_name]['completion_tokens'].append(token_data.get('completion_tokens', 0))
+        self.token_usage[step_name]['prompt_tokens'].append(token_data.get('prompt_tokens', 0))
+        self.token_usage[step_name]['total_tokens'].append(token_data.get('total_tokens', 0))
 
         logging.info(f"Evaluation: {evaluation}")
 
         EVALUATION_PARSING_PROMPT = self.prompts["evaluation_parsing_prompt"]
 
-        response_json = await asingle_shot_llm_call(
+        response_json, token_data = await asingle_shot_llm_call(
             model=self.json_model,
             system_prompt=EVALUATION_PARSING_PROMPT,
             message=f"Evaluation to be parsed: {evaluation}",
             response_format={"type": "json_object", "schema": ResearchPlan.model_json_schema()},
         )
+        
+        # Track token usage for JSON parsing
+        json_step_name = "json_parsing"
+        if json_step_name not in self.token_usage:
+            self.token_usage[json_step_name] = {
+                'completion_tokens': [],
+                'prompt_tokens': [],
+                'total_tokens': []
+            }
+        
+        self.token_usage[json_step_name]['completion_tokens'].append(token_data.get('completion_tokens', 0))
+        self.token_usage[json_step_name]['prompt_tokens'].append(token_data.get('prompt_tokens', 0))
+        self.token_usage[json_step_name]['total_tokens'].append(token_data.get('total_tokens', 0))
 
         evaluation = json.loads(response_json)
         return evaluation["queries"]
@@ -445,7 +817,7 @@ class DeepResearcher:
 
         FILTER_PROMPT = self.prompts["filter_prompt"]
 
-        filter_response = await asingle_shot_llm_call(
+        filter_response, token_data = await asingle_shot_llm_call(
             model=self.planning_model,
             system_prompt=FILTER_PROMPT,
             message=(
@@ -455,17 +827,43 @@ class DeepResearcher:
             # NOTE: This is the max_token parameter for the LLM call on Together AI, may need to be changed for other providers
             max_completion_tokens=4096,
         )
+        
+        # Track token usage
+        step_name = "filter"
+        if step_name not in self.token_usage:
+            self.token_usage[step_name] = {
+                'completion_tokens': [],
+                'prompt_tokens': [],
+                'total_tokens': []
+            }
+        
+        self.token_usage[step_name]['completion_tokens'].append(token_data.get('completion_tokens', 0))
+        self.token_usage[step_name]['prompt_tokens'].append(token_data.get('prompt_tokens', 0))
+        self.token_usage[step_name]['total_tokens'].append(token_data.get('total_tokens', 0))
 
         logging.info(f"Filter response: {filter_response}")
 
         FILTER_PARSING_PROMPT = self.prompts["filter_parsing_prompt"]
 
-        response_json = await asingle_shot_llm_call(
+        response_json, token_data = await asingle_shot_llm_call(
             model=self.json_model,
             system_prompt=FILTER_PARSING_PROMPT,
             message=f"Filter response to be parsed: {filter_response}",
             response_format={"type": "json_object", "schema": SourceList.model_json_schema()},
         )
+        
+        # Track token usage for JSON parsing
+        json_step_name = "json_parsing"
+        if json_step_name not in self.token_usage:
+            self.token_usage[json_step_name] = {
+                'completion_tokens': [],
+                'prompt_tokens': [],
+                'total_tokens': []
+            }
+        
+        self.token_usage[json_step_name]['completion_tokens'].append(token_data.get('completion_tokens', 0))
+        self.token_usage[json_step_name]['prompt_tokens'].append(token_data.get('prompt_tokens', 0))
+        self.token_usage[json_step_name]['total_tokens'].append(token_data.get('total_tokens', 0))
 
         sources = json.loads(response_json)["sources"]
 
@@ -488,13 +886,26 @@ class DeepResearcher:
         formatted_results = str(results)
         ANSWER_PROMPT = self.prompts["answer_prompt"]
 
-        answer = await asingle_shot_llm_call(
+        answer, token_data = await asingle_shot_llm_call(
             model=self.answer_model,
             system_prompt=ANSWER_PROMPT,
             message=f"Research Topic: {topic}\n\nSearch Results:\n{formatted_results}",
             # NOTE: This is the max_token parameter for the LLM call on Together AI, may need to be changed for other providers
             max_completion_tokens=self.max_completion_tokens,
         )
+        
+        # Track token usage
+        step_name = "write report"
+        if step_name not in self.token_usage:
+            self.token_usage[step_name] = {
+                'completion_tokens': [],
+                'prompt_tokens': [],
+                'total_tokens': []
+            }
+        
+        self.token_usage[step_name]['completion_tokens'].append(token_data.get('completion_tokens', 0))
+        self.token_usage[step_name]['prompt_tokens'].append(token_data.get('prompt_tokens', 0))
+        self.token_usage[step_name]['total_tokens'].append(token_data.get('total_tokens', 0))
 
         # this is just to avoid typing complaints
         if answer is None or not isinstance(answer, str):
@@ -540,11 +951,12 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/open_deep_researcher_config.yaml",
+        default="configs/open_deep_researcher_config_turbo.yaml",
         help="Path to configuration file (required)",
     )
-
     parser.add_argument("--output_file", type=str, default="", help="Path to the output file")
+    parser.add_argument("--profile", action="store_true", help="Enable profiling of the research process")
+    parser.add_argument("--profile-dir", type=str, default="profile_data", help="Directory to save profiling data and visualizations")
     args = parser.parse_args()
 
     load_dotenv()
@@ -555,8 +967,14 @@ def main():
     # Use the agent factory with the config file
     logging.info(f"Using configuration from file: {args.config}")
 
+    # Setup additional parameters for profiling
+    extra_params = {}
+    if args.profile:
+        extra_params["profile_output_dir"] = args.profile_dir
+        logging.info(f"Profiling enabled, data will be saved to: {args.profile_dir}")
+    
     # Get the researcher instance directly instead of the callable function
-    researcher_instance = create_agent(args.config, return_instance=True)
+    researcher_instance = create_agent(args.config, return_instance=True, **extra_params)
 
     # Get the callable function
     def researcher(topic):
@@ -599,6 +1017,47 @@ def main():
     if args.write_html:
         filename = f"research_report_{sanitized_topic_name}.html" if args.output_file == "" else f"{args.output_file}.html"
         save_and_generate_html(answer, filename, toc_image_url, base64_audio=base64_audio)
+    
+    # Show profiling summary if enabled
+    if args.profile and researcher_instance.profiling_data:
+        total_time = researcher_instance.profiling_data.get("total_execution_time", [0])[0]
+        print(f"\nResearch completed in {total_time:.2f} seconds")
+        print(f"Profiling data and visualizations saved to {args.profile_dir}")
+        
+        # Print time breakdown for major steps
+        print("\nTime breakdown by major steps:")
+        step_totals = {step: sum(times) for step, times in researcher_instance.profiling_data.items() 
+                     if step != "total_execution_time"}
+        
+        # Sort steps by total time (descending)
+        sorted_steps = sorted(step_totals.items(), key=lambda x: x[1], reverse=True)
+        for step, time in sorted_steps:
+            print(f"  {step}: {time:.2f}s ({time/total_time*100:.1f}%)")
+            
+        # Print token usage summary if available
+        if researcher_instance.token_usage:
+            print("\nToken usage by step:")
+            
+            # Calculate total tokens for each step
+            token_totals = {step: sum(data['total_tokens']) for step, data in researcher_instance.token_usage.items()}
+            total_tokens = sum(token_totals.values())
+            
+            # Calculate prompt and completion tokens
+            prompt_totals = {step: sum(data['prompt_tokens']) for step, data in researcher_instance.token_usage.items()}
+            completion_totals = {step: sum(data['completion_tokens']) for step, data in researcher_instance.token_usage.items()}
+            
+            total_prompt_tokens = sum(prompt_totals.values())
+            total_completion_tokens = sum(completion_totals.values())
+            
+            # Sort steps by total tokens (descending)
+            sorted_token_steps = sorted(token_totals.items(), key=lambda x: x[1], reverse=True)
+            
+            for step, tokens in sorted_token_steps:
+                print(f"  {step}: {tokens} tokens ({tokens/total_tokens*100:.1f}%) - "
+                      f"Prompt: {prompt_totals[step]} / Completion: {completion_totals[step]}")
+                
+            print(f"\nTotal tokens: {total_tokens} "
+                  f"(Prompt: {total_prompt_tokens} / Completion: {total_completion_tokens})")
 
     print(answer)
 

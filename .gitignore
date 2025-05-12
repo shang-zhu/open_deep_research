@@ -2,6 +2,7 @@ debug.txt
 pyrightconfig.json
 benchmark/benchmark_results/*
 benchmark/datasets/*
+profile_data/*
 *.html
 *.pdf
 *.mp3

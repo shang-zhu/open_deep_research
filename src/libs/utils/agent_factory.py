@@ -10,9 +10,14 @@ def load_config(config_path: str):
         return yaml.safe_load(file)
 
 
-def create_agent(config: str, return_instance: bool = False) -> Any:
+def create_agent(config: str, return_instance: bool = False, **kwargs) -> Any:
     """
     Factory method to create an agent with specified configuration.
+    
+    Args:
+        config: Path to the configuration file
+        return_instance: If True, return the agent instance; otherwise, return a callable
+        **kwargs: Additional keyword arguments to pass to the agent constructor
     """
 
     config_dict = load_config(config)
@@ -22,6 +27,8 @@ def create_agent(config: str, return_instance: bool = False) -> Any:
 
     if agent_type == "deep_researcher":
         agent_config["budget"] = agent_config.pop("max_steps")
+        # Merge any additional kwargs with the config
+        agent_config.update(kwargs)
         researcher = DeepResearcher(**agent_config)
 
         if return_instance:
