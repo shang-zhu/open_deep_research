@@ -24,12 +24,13 @@ async def asingle_shot_llm_call(
         max_tokens=max_completion_tokens,
         timeout=600,
     )
-    
+
     # Extract token usage data
     token_usage = {}
     if hasattr(response, 'usage'):
         usage = response.usage
         token_usage = {
+            'message': [{"role": "system", "content": system_prompt}, {'role': 'user', 'content': message}],
             'completion_tokens': getattr(usage, 'completion_tokens', 0),
             'prompt_tokens': getattr(usage, 'prompt_tokens', 0),
             'total_tokens': getattr(usage, 'total_tokens', 0),

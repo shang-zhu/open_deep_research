@@ -18,7 +18,6 @@ from filelock import FileLock
 from libs.utils.data_types import DeepResearchResult, DeepResearchResults, ResearchPlan, SourceList, UserCommunication
 from libs.utils.generation import generate_pdf, save_and_generate_html
 from libs.utils.llms import asingle_shot_llm_call, generate_toc_image
-from libs.utils.log import AgentLogger
 from libs.utils.podcast import generate_podcast_audio, generate_podcast_script, get_base64_audio, save_podcast_to_disk
 from libs.utils.tavily_search import atavily_search_results
 
@@ -119,244 +118,34 @@ class DeepResearcher:
             logging.info(f"Step '{step_name}' took {elapsed:.2f} seconds")
 
     def save_profile_data(self, topic: str):
-        """Save profiling data to files and generate visualizations"""
+        """Save profiling data to files in JSONL format"""
         if not self.profile_output_dir:
             return
         
-        # Sanitize topic for filename
-        sanitized_topic = re.sub(r'[\\/*?:"<>|]', "_", topic)
+        # Ensure directory exists
+        os.makedirs(self.profile_output_dir, exist_ok=True)
         
-        # Save raw profile data
-        profile_file = os.path.join(self.profile_output_dir, f"profile_data_{sanitized_topic}.json")
-        with open(profile_file, 'w') as f:
-            json.dump(self.profiling_data, f, indent=2)
+        # Save profile data in JSONL format
+        profile_file = os.path.join(self.profile_output_dir, "profile_data.jsonl")
+        with open(profile_file, 'a') as f:
+            profile_entry = {
+                "input": topic,
+                "profile_data": self.profiling_data,
+                "timestamp": time.time()
+            }
+            f.write(json.dumps(profile_entry) + '\n')
         
-        # Save token usage data
-        token_file = os.path.join(self.profile_output_dir, f"token_usage_{sanitized_topic}.json")
-        with open(token_file, 'w') as f:
-            json.dump(self.token_usage, f, indent=2)
+        # Save token usage in JSONL format
+        token_file = os.path.join(self.profile_output_dir, "token_usage.jsonl")
+        with open(token_file, 'a') as f:
+            token_entry = {
+                "input": topic,
+                "token_usage": self.token_usage,
+                "timestamp": time.time()
+            }
+            f.write(json.dumps(token_entry) + '\n')
         
-        # Generate cumulative time chart
-        self._generate_profile_charts(sanitized_topic)
-        
-        logging.info(f"Profiling data saved to {self.profile_output_dir}")
-
-    def _generate_profile_charts(self, topic_name: str):
-        """Generate charts for profiling data"""
-        if not self.profiling_data:
-            return
-            
-        # Calculate total time per step
-        step_totals = {step: sum(times) for step, times in self.profiling_data.items()}
-        
-        # Create time distribution pie chart (excluding total_execution_time)
-        pie_data = {k: v for k, v in step_totals.items() if k != "total_execution_time" and k != "sequential search" and k != "sequential summarize"}
-        plt.figure(figsize=(10, 6))
-        plt.pie(list(pie_data.values()), labels=list(pie_data.keys()), autopct='%1.1f%%')
-        plt.title('Time Distribution Across Research Steps')
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.profile_output_dir, f"time_distribution_{topic_name}.png"))
-        plt.close()
-        
-        # Create bar chart of step durations
-        bar_data = {k: v for k, v in step_totals.items() if k != "sequential search" and k != "sequential summarize"}
-        plt.figure(figsize=(12, 6))
-        steps = list(bar_data.keys())
-        durations = list(bar_data.values())
-        plt.barh(steps, durations)
-        plt.xlabel('Time (seconds)')
-        plt.title('Duration of Each Research Step')
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.profile_output_dir, f"step_durations_{topic_name}.png"))
-        plt.close()
-        
-        # Generate token usage charts if we have that data
-        if self.token_usage:
-            self._generate_token_usage_charts(topic_name)
-            
-        # Create a flame graph visualization
-        self._generate_simple_flame_graph(topic_name)
-        
-    def _generate_token_usage_charts(self, topic_name: str):
-        """Generate charts for token usage data"""
-        if not self.token_usage:
-            return
-            
-        # Calculate total tokens per step
-        token_totals = {step: sum(data['total_tokens']) for step, data in self.token_usage.items()}
-        
-        # Create token distribution pie chart
-        plt.figure(figsize=(10, 6))
-        plt.pie(list(token_totals.values()), labels=list(token_totals.keys()), autopct='%1.1f%%')
-        plt.title('Token Usage Distribution Across Steps')
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.profile_output_dir, f"token_distribution_{topic_name}.png"))
-        plt.close()
-        
-        # Create bar charts showing both total sums and means with std
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
-        steps = list(self.token_usage.keys())
-        
-        # Calculate sums, means and standard deviations
-        prompt_sums = [sum(data['prompt_tokens']) for step, data in self.token_usage.items()]
-        completion_sums = [sum(data['completion_tokens']) for step, data in self.token_usage.items()]
-        prompt_means = [np.mean(data['prompt_tokens']) for step, data in self.token_usage.items()]
-        prompt_stds = [np.std(data['prompt_tokens']) if len(data['prompt_tokens']) > 1 else 0 
-                      for step, data in self.token_usage.items()]
-        completion_means = [np.mean(data['completion_tokens']) for step, data in self.token_usage.items()]
-        completion_stds = [np.std(data['completion_tokens']) if len(data['completion_tokens']) > 1 else 0 
-                         for step, data in self.token_usage.items()]
-        
-        x = np.arange(len(steps))
-        width = 0.35
-        
-        # Left subplot: Total sums
-        ax1.bar(x - width/2, prompt_sums, width, label='Prompt Tokens')
-        ax1.bar(x + width/2, completion_sums, width, label='Completion Tokens')
-        ax1.set_xlabel('Steps')
-        ax1.set_ylabel('Total Number of Tokens')
-        ax1.set_title('Total Token Usage by Step')
-        ax1.set_xticks(x)
-        ax1.set_xticklabels(steps, rotation=45, ha='right')
-        
-        # Add sum values on top of bars
-        for i in range(len(steps)):
-            ax1.text(i - width/2, prompt_sums[i], f'{prompt_sums[i]:,}', 
-                    ha='center', va='bottom', rotation=45)
-            ax1.text(i + width/2, completion_sums[i], f'{completion_sums[i]:,}', 
-                    ha='center', va='bottom', rotation=45)
-        
-        # Right subplot: Means with std
-        bars1 = ax2.bar(x - width/2, prompt_means, width, yerr=prompt_stds, 
-                       capsize=5, label='Prompt Tokens')
-        bars2 = ax2.bar(x + width/2, completion_means, width, yerr=completion_stds, 
-                       capsize=5, label='Completion Tokens')
-        ax2.set_xlabel('Steps')
-        ax2.set_ylabel('Mean Number of Tokens')
-        ax2.set_title('Mean Token Usage by Step (with Standard Deviation)')
-        ax2.set_xticks(x)
-        ax2.set_xticklabels(steps, rotation=45, ha='right')
-        
-        # Add mean±std values on top of bars
-        for i in range(len(steps)):
-            ax2.text(i - width/2, prompt_means[i] + prompt_stds[i], 
-                    f'μ={prompt_means[i]:.0f}±{prompt_stds[i]:.0f}', 
-                    ha='center', va='bottom', rotation=45)
-            ax2.text(i + width/2, completion_means[i] + completion_stds[i], 
-                    f'μ={completion_means[i]:.0f}±{completion_stds[i]:.0f}', 
-                    ha='center', va='bottom', rotation=45)
-        
-        # Add legends to both subplots
-        ax1.legend()
-        ax2.legend()
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.profile_output_dir, f"token_breakdown_{topic_name}.png"))
-        plt.close()
-
-    def _generate_simple_flame_graph(self, topic_name: str):
-        """Generate a simple flame graph visualization of the research process"""
-        if not self.profiling_data:
-            return
-            
-        # Group steps by their common prefixes (e.g., "evaluate_research_iteration_1" -> "evaluate")
-        step_groups = {}
-        for step in self.profiling_data:
-            # Extract the first part of the step name before underscore
-            main_category = step.split('_')[0] if '_' in step else step
-            if main_category not in step_groups:
-                step_groups[main_category] = []
-            
-            # Add this step to its group with its duration
-            for duration in self.profiling_data[step]:
-                step_groups[main_category].append((step, duration))
-        
-        # Sort groups by their first appearance in the process
-        # This is approximate since we don't track the exact order of calls
-        ordered_groups = []
-        for step_type in ['total_execution_time', 'topic clarification', 'generate queries', 'search and summarize', 'evaluate research completeness', 'filter', 'write report']:
-            if step_type in step_groups:
-                ordered_groups.append(step_type)
-                
-        # Define a colormap with distinct colors for each category
-        colors = plt.cm.viridis(np.linspace(0, 0.9, len(ordered_groups)))
-        color_map = {group: colors[i] for i, group in enumerate(ordered_groups)}
-        
-        # Create the figure
-        plt.figure(figsize=(12, 8))
-        
-        # Current y position
-        y_pos = 0
-        max_time = 0
-        
-        # Track positions for labels
-        label_positions = {}
-        
-        # Draw each group
-        for group in ordered_groups[::-1]:
-            if group not in step_groups:
-                continue
-                
-            steps = step_groups[group]
-            group_color = color_map[group]
-            group_height = sum(duration for _, duration in steps)
-            
-            # Sort steps by duration (larger first for better visualization)
-            steps.sort(key=lambda x: x[1], reverse=True)
-            
-            # Record the center position for the label
-            label_positions[group] = (0, y_pos + group_height/2)
-            
-            # Keep track of current x position within this row
-            x_pos = 0
-            
-            # Draw each step as a rectangle
-            for step_name, duration in steps:
-                # Draw the rectangle for this step
-                plt.fill_between(
-                    [x_pos, x_pos + duration],
-                    [y_pos, y_pos],
-                    [y_pos + duration, y_pos + duration],
-                    color=group_color,
-                    alpha=0.7,
-                    edgecolor='black',
-                    linewidth=0.5
-                )
-                
-                # Update max_time if needed
-                max_time = max(max_time, x_pos + duration)
-                
-                # Move to the next x position
-                x_pos += duration
-            
-            # Move to the next row
-            y_pos += group_height + 0.5  # Add a small gap between rows
-        
-        # Add labels for each group
-        for group, (x, y) in label_positions.items():
-            plt.text(
-                max_time + 1,  # Place labels at the right side
-                y,
-                group,
-                ha='left',
-                va='center'
-            )
-        
-        # Set chart properties
-        plt.xlabel('Cumulative Time (seconds)')
-        plt.title('Research Process Flame Graph')
-        plt.grid(axis='x', linestyle='--', alpha=0.3)
-        
-        # Only show the bottom of the y-axis
-        plt.yticks([])
-        
-        # Set suitable x-axis limits
-        plt.xlim(0, max_time * 1.15)  # Add some space for labels
-        
-        # Save the figure
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.profile_output_dir, f"flame_graph_{topic_name}.png"))
-        plt.close()
+        logging.info(f"Profile data saved to {self.profile_output_dir}")
 
     async def research_topic(self, topic: str) -> str:
         """Main method to conduct research on a topic"""
@@ -501,11 +290,13 @@ class DeepResearcher:
         step_name = "topic clarification"
         if step_name not in self.token_usage:
             self.token_usage[step_name] = {
+                'messages': [],
                 'completion_tokens': [],
                 'prompt_tokens': [],
                 'total_tokens': []
             }
         
+        self.token_usage[step_name]['messages'].append(token_data.get('message', []))
         self.token_usage[step_name]['completion_tokens'].append(token_data.get('completion_tokens', 0))
         self.token_usage[step_name]['prompt_tokens'].append(token_data.get('prompt_tokens', 0))
         self.token_usage[step_name]['total_tokens'].append(token_data.get('total_tokens', 0))
@@ -536,6 +327,7 @@ class DeepResearcher:
             )
             
             # Track token usage for follow-up clarification
+            self.token_usage[step_name]['messages'].append(token_data.get('message', []))
             self.token_usage[step_name]['completion_tokens'].append(token_data.get('completion_tokens', 0))
             self.token_usage[step_name]['prompt_tokens'].append(token_data.get('prompt_tokens', 0))
             self.token_usage[step_name]['total_tokens'].append(token_data.get('total_tokens', 0))
@@ -557,11 +349,13 @@ class DeepResearcher:
         step_name = "generate queries"
         if step_name not in self.token_usage:
             self.token_usage[step_name] = {
+                'messages': [],
                 'completion_tokens': [],
                 'prompt_tokens': [],
                 'total_tokens': []
             }
         
+        self.token_usage[step_name]['messages'].append(token_data.get('message', []))
         self.token_usage[step_name]['completion_tokens'].append(token_data.get('completion_tokens', 0))
         self.token_usage[step_name]['prompt_tokens'].append(token_data.get('prompt_tokens', 0))
         self.token_usage[step_name]['total_tokens'].append(token_data.get('total_tokens', 0))
@@ -581,11 +375,13 @@ class DeepResearcher:
         json_step_name = "json_parsing"
         if json_step_name not in self.token_usage:
             self.token_usage[json_step_name] = {
+                'messages': [],
                 'completion_tokens': [],
                 'prompt_tokens': [],
                 'total_tokens': []
             }
         
+        self.token_usage[json_step_name]['messages'].append(token_data.get('message', []))
         self.token_usage[json_step_name]['completion_tokens'].append(token_data.get('completion_tokens', 0))
         self.token_usage[json_step_name]['prompt_tokens'].append(token_data.get('prompt_tokens', 0))
         self.token_usage[json_step_name]['total_tokens'].append(token_data.get('total_tokens', 0))
@@ -738,6 +534,7 @@ class DeepResearcher:
         step_name = "summarize"
         if step_name not in self.token_usage:
             self.token_usage[step_name] = {
+                'messages': [],
                 'completion_tokens': [],
                 'prompt_tokens': [],
                 'total_tokens': []
@@ -773,11 +570,13 @@ class DeepResearcher:
         step_name = "evaluate research completeness"
         if step_name not in self.token_usage:
             self.token_usage[step_name] = {
+                'messages': [],
                 'completion_tokens': [],
                 'prompt_tokens': [],
                 'total_tokens': []
             }
         
+        self.token_usage[step_name]['messages'].append(token_data.get('message', []))
         self.token_usage[step_name]['completion_tokens'].append(token_data.get('completion_tokens', 0))
         self.token_usage[step_name]['prompt_tokens'].append(token_data.get('prompt_tokens', 0))
         self.token_usage[step_name]['total_tokens'].append(token_data.get('total_tokens', 0))
@@ -797,11 +596,13 @@ class DeepResearcher:
         json_step_name = "json_parsing"
         if json_step_name not in self.token_usage:
             self.token_usage[json_step_name] = {
+                'messages': [],
                 'completion_tokens': [],
                 'prompt_tokens': [],
                 'total_tokens': []
             }
         
+        self.token_usage[json_step_name]['messages'].append(token_data.get('message', []))
         self.token_usage[json_step_name]['completion_tokens'].append(token_data.get('completion_tokens', 0))
         self.token_usage[json_step_name]['prompt_tokens'].append(token_data.get('prompt_tokens', 0))
         self.token_usage[json_step_name]['total_tokens'].append(token_data.get('total_tokens', 0))
@@ -832,6 +633,7 @@ class DeepResearcher:
         step_name = "filter"
         if step_name not in self.token_usage:
             self.token_usage[step_name] = {
+                'messages': [],
                 'completion_tokens': [],
                 'prompt_tokens': [],
                 'total_tokens': []
@@ -898,11 +700,13 @@ class DeepResearcher:
         step_name = "write report"
         if step_name not in self.token_usage:
             self.token_usage[step_name] = {
+                'messages': [],
                 'completion_tokens': [],
                 'prompt_tokens': [],
                 'total_tokens': []
             }
         
+        self.token_usage[step_name]['messages'].append(token_data.get('message', []))
         self.token_usage[step_name]['completion_tokens'].append(token_data.get('completion_tokens', 0))
         self.token_usage[step_name]['prompt_tokens'].append(token_data.get('prompt_tokens', 0))
         self.token_usage[step_name]['total_tokens'].append(token_data.get('total_tokens', 0))
